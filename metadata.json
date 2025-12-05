@@ -1,0 +1,7 @@
+{
+  "name": "OrderSheetApp",
+  "description": "Scan invoices, extract data using Gemini AI, and prepare orders based on PAR levels.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
