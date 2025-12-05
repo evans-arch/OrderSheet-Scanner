@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { extractInvoiceData } from './services/geminiService';
 import { InvoiceItem, InvoiceRecord, AppView, AppSettings } from './types';
-import { Button, Input, Card, Badge, Toast, Modal } from './components/UI';
+import { Button, Input, Card, Badge, Toast, Modal, Switch } from './components/UI';
 import { 
   Camera, 
   FileText, 
@@ -16,7 +16,11 @@ import {
   ExternalLink,
   Sheet,
   Upload,
-  ArrowDownAZ
+  ArrowDownAZ,
+  Zap,
+  CheckCircle2,
+  AlertCircle,
+  AlertTriangle
 } from 'lucide-react';
 
 const STORAGE_KEY = 'ordersheet_history';
@@ -25,12 +29,55 @@ const SETTINGS_KEY = 'ordersheet_settings';
 // The specific sheet URL provided by the user
 const DEFAULT_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1c9qt5RejeAZ_tn-gXhFaDwVSIgZdmgRPojKD1LqhRYc/edit?gid=0#gid=0';
 
+// Helper to resize images before sending to API (Fixes mobile crash issues)
+const resizeImage = (file: File): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target?.result as string;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        
+        // Max dimension 1500px is usually plenty for OCR and keeps size down
+        const MAX_DIMENSION = 1500;
+        
+        if (width > height) {
+          if (width > MAX_DIMENSION) {
+            height *= MAX_DIMENSION / width;
+            width = MAX_DIMENSION;
+          }
+        } else {
+          if (height > MAX_DIMENSION) {
+            width *= MAX_DIMENSION / height;
+            height = MAX_DIMENSION;
+          }
+        }
+        
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        
+        // Convert to base64, reduce quality to 0.8 to save bandwidth
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        resolve(dataUrl.split(',')[1]); // Return just the base64 data
+      };
+      img.onerror = (error) => reject(error);
+    };
+    reader.onerror = (error) => reject(error);
+  });
+};
+
 const App: React.FC = () => {
   const [view, setView] = useState<AppView>(AppView.DASHBOARD);
   const [items, setItems] = useState<InvoiceItem[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [loadingStep, setLoadingStep] = useState<string | null>(null); // 'analyzing' | 'uploading'
   const [history, setHistory] = useState<InvoiceRecord[]>([]);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   
   // New state to control whether we are starting fresh or adding to existing
@@ -39,7 +86,8 @@ const App: React.FC = () => {
 
   const [settings, setSettings] = useState<AppSettings>({
     googleSheetUrl: DEFAULT_SHEET_URL,
-    scriptUrl: ''
+    scriptUrl: '',
+    autoExport: true // Default to true to encourage automation
   });
   
   // File input refs
@@ -60,12 +108,18 @@ const App: React.FC = () => {
     const savedSettings = localStorage.getItem(SETTINGS_KEY);
     if (savedSettings) {
       try {
-        setSettings(JSON.parse(savedSettings));
+        const parsed = JSON.parse(savedSettings);
+        setSettings({
+          scriptUrl: parsed.scriptUrl || '',
+          googleSheetUrl: DEFAULT_SHEET_URL, // Always force the correct URL
+          autoExport: parsed.autoExport ?? true
+        });
       } catch (e) {
         console.error("Failed to parse settings", e);
+        setSettings({ googleSheetUrl: DEFAULT_SHEET_URL, scriptUrl: '', autoExport: true });
       }
     } else {
-      setSettings(prev => ({ ...prev, googleSheetUrl: DEFAULT_SHEET_URL }));
+      setSettings({ googleSheetUrl: DEFAULT_SHEET_URL, scriptUrl: '', autoExport: true });
     }
   }, []);
 
@@ -88,55 +142,133 @@ const App: React.FC = () => {
     }
   };
 
+  const uploadToScript = async (dataToUpload: InvoiceItem[], currentScriptUrl: string) => {
+    if (!currentScriptUrl) {
+      return false;
+    }
+    
+    // Sort before uploading for consistency
+    const sortedData = [...dataToUpload].sort((a, b) => 
+      a.description.toLowerCase().localeCompare(b.description.toLowerCase())
+    );
+
+    const payload = sortedData.map(i => ({
+      inStock: i.inStock,
+      par: i.par,
+      order: i.order,
+      description: i.description,
+      vendor: i.vendor,
+      price: i.price
+    }));
+
+    try {
+      console.log("Uploading to:", currentScriptUrl);
+      const response = await fetch(currentScriptUrl, {
+        method: 'POST',
+        // Standard mode to read response, requires "Anyone" access on script
+        headers: { 'Content-Type': 'text/plain' }, 
+        body: JSON.stringify({ items: payload })
+      });
+      
+      const text = await response.text();
+      console.log("Script Response:", text);
+      
+      if (text.includes("Success")) {
+        return true;
+      } else {
+        console.error("Script returned error:", text);
+        return false;
+      }
+    } catch (e) {
+      console.error("Upload Error:", e);
+      return false;
+    }
+  };
+
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
     setIsProcessing(true);
+    setLoadingStep('analyzing');
     setView(AppView.SCAN);
-    setStatusMessage(scanMode === 'append' ? "Processing next page..." : "Analyzing invoice...");
-
+    
     try {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const base64Raw = e.target?.result as string;
-        const base64Data = base64Raw.split(',')[1];
-        
-        try {
-          const extractedItems = await extractInvoiceData(base64Data, file.type);
-          
-          setItems(prev => {
-            if (scanMode === 'append') {
-              return [...prev, ...extractedItems];
-            } else {
-              return extractedItems;
-            }
-          });
-          
-          if (scanMode === 'append') {
-            const count = extractedItems.length;
-            setToastMessage(`Added ${count} items`);
-          } else {
-            const count = extractedItems.length;
-            const vendor = extractedItems[0]?.vendor || "Unknown Vendor";
-            setToastMessage(`Scanned ${count} items for ${vendor}`);
-          }
+      let base64Data = "";
+      let mimeType = file.type;
 
-          setView(AppView.REVIEW);
-        } catch (error) {
-          alert("Failed to extract data. Please try again with a clearer image.");
-          // If append failed, go back to review with old items
-          if (scanMode === 'append') setView(AppView.REVIEW);
-          else setView(AppView.DASHBOARD);
-        } finally {
-          setIsProcessing(false);
-          setStatusMessage(null);
+      // Check if it is an image and compress it
+      if (file.type.startsWith('image/')) {
+        try {
+          base64Data = await resizeImage(file);
+          mimeType = 'image/jpeg'; // Canvas exports as jpeg
+        } catch (resizeErr) {
+          console.warn("Resize failed, falling back to original", resizeErr);
+          // Fallback to original read
+          base64Data = await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onload = (e) => resolve((e.target?.result as string).split(',')[1]);
+            reader.readAsDataURL(file);
+          }) as string;
         }
-      };
-      reader.readAsDataURL(file);
+      } else {
+        // Handle PDF or other files without resize
+         base64Data = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (e) => resolve((e.target?.result as string).split(',')[1]);
+          reader.readAsDataURL(file);
+        }) as string;
+      }
+      
+      try {
+        const extractedItems = await extractInvoiceData(base64Data, mimeType);
+        
+        const vendor = extractedItems[0]?.vendor || "Unknown Vendor";
+        const successMessage = `Scanned ${extractedItems.length} items for ${vendor}`;
+
+        // AUTO EXPORT LOGIC
+        if (settings.autoExport && settings.scriptUrl) {
+          setLoadingStep('uploading');
+          // Small delay to let UI update
+          await new Promise(r => setTimeout(r, 500));
+          
+          const success = await uploadToScript(extractedItems, settings.scriptUrl);
+          
+          if (success) {
+            setToastMessage("Auto-Export Successful! ✅");
+          } else {
+            setToastMessage("Auto-Export Failed. Check settings.");
+            setShowExportModal(true); // Fallback to manual
+          }
+        } else if (settings.autoExport && !settings.scriptUrl) {
+           setToastMessage("Skipped Auto-Export: Script URL not set in Settings");
+        } else {
+           setToastMessage(successMessage);
+        }
+
+        // Update state finally
+        setItems(prev => {
+          if (scanMode === 'append') {
+            return [...prev, ...extractedItems];
+          } else {
+            return extractedItems;
+          }
+        });
+
+        setView(AppView.REVIEW);
+      } catch (error) {
+        console.error(error);
+        alert("Failed to extract data. Use a clearer photo or try a smaller file.");
+        if (scanMode === 'append') setView(AppView.REVIEW);
+        else setView(AppView.DASHBOARD);
+      } finally {
+        setIsProcessing(false);
+        setLoadingStep(null);
+      }
     } catch (error) {
       console.error(error);
       setIsProcessing(false);
+      setLoadingStep(null);
       alert("Error reading file.");
     }
   };
@@ -180,7 +312,6 @@ const App: React.FC = () => {
     setToastMessage("Sorted by Description");
   };
 
-  // Helper to get sorted items for export without affecting view if not desired
   const getSortedExportData = () => {
     return [...items]
       .sort((a, b) => a.description.toLowerCase().localeCompare(b.description.toLowerCase()))
@@ -209,7 +340,7 @@ const App: React.FC = () => {
     }
   };
 
-  const handleExport = async () => {
+  const handleManualExport = async () => {
     // 1. Save history
     const newRecord: InvoiceRecord = {
       id: Date.now().toString(),
@@ -220,50 +351,84 @@ const App: React.FC = () => {
     };
     setHistory(prev => [newRecord, ...prev]);
 
-    // 2. Prepare Data (Always Sorted)
-    const exportData = getSortedExportData();
-
-    // 3. Try Auto-Upload if configured
-    if (settings.scriptUrl && settings.scriptUrl.startsWith('https://script.google.com')) {
-      setStatusMessage("Sending to Sheet...");
+    // 2. Try Script Upload
+    if (settings.scriptUrl) {
+      setLoadingStep('uploading');
       setIsProcessing(true);
       
-      try {
-        await fetch(settings.scriptUrl, {
-          method: 'POST',
-          mode: 'no-cors', 
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: exportData })
-        });
-        
+      const success = await uploadToScript(items, settings.scriptUrl);
+      setIsProcessing(false);
+      setLoadingStep(null);
+      
+      if (success) {
         setToastMessage("Sent to Sheet! (Sorted by name)");
-        
-        // Optional: Still copy to clipboard just in case
-        copyToClipboard();
-        
-        setTimeout(() => {
-          setIsProcessing(false);
-          setView(AppView.DASHBOARD);
-        }, 1500);
+        setTimeout(() => setView(AppView.DASHBOARD), 1000);
         return;
-
-      } catch (e) {
-        console.error(e);
-        setIsProcessing(false);
-        setToastMessage("Auto-upload failed. Switching to manual.");
+      } else {
+        setToastMessage("Auto-upload failed. Switching to manual copy.");
       }
     }
 
-    // 4. Manual Fallback
+    // 3. Fallback to clipboard
     await copyToClipboard();
     setShowExportModal(true);
   };
+
+  // Pre-configured script code for the user
+  const SCRIPT_CODE = `// COPY ALL OF THIS CODE
+function doPost(e) {
+  // 1. SAFEGUARD FOR MANUAL RUNS
+  if (typeof e === 'undefined') {
+    return ContentService.createTextOutput("Error: Event object 'e' is undefined. You cannot run this function manually from the editor. It must be triggered by the App.");
+  }
+
+  var lock = LockService.getScriptLock();
+  // Wait for up to 10 seconds for other processes to finish.
+  if (!lock.tryLock(10000)) {
+     return ContentService.createTextOutput("Error: Could not obtain lock.");
+  }
+
+  try {
+    // AUTO-CONFIGURED FOR YOUR SHEET ID:
+    var sheet = SpreadsheetApp.openById("1c9qt5RejeAZ_tn-gXhFaDwVSIgZdmgRPojKD1LqhRYc").getSheets()[0];
+    
+    // Parse the data
+    var rawData = e.postData ? e.postData.contents : null;
+    if (!rawData) return ContentService.createTextOutput("Error: No data received.");
+
+    var data = JSON.parse(rawData);
+    
+    if (data.items && data.items.length > 0) {
+      var rows = data.items.map(function(item) {
+        return [
+          item.vendor || "", 
+          item.description || "", 
+          item.inStock || 0, 
+          item.par || 0, 
+          item.order || 0, 
+          item.price || 0
+          // Removed Date Timestamp as requested
+        ];
+      });
+      
+      // Batch write for better performance
+      sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+    }
+    
+    return ContentService.createTextOutput("Success").setMimeType(ContentService.MimeType.TEXT);
+    
+  } catch (err) {
+    return ContentService.createTextOutput("Error: " + err.toString());
+  } finally {
+    lock.releaseLock();
+  }
+}`;
 
   const renderDashboard = () => (
     <div className="space-y-6">
       <div className="bg-gradient-to-r from-green-600 to-emerald-600 rounded-2xl p-6 text-white shadow-lg relative overflow-hidden">
         <div className="relative z-10">
-          <h1 className="text-3xl font-bold mb-2">Inventory Scanner</h1>
+          <h1 className="text-3xl font-bold mb-2">OrderSheet</h1>
           <p className="opacity-90 mb-6 max-w-xs">Scan invoices to extract items & calculate orders.</p>
           
           <div className="grid grid-cols-2 gap-3">
@@ -331,72 +496,135 @@ const App: React.FC = () => {
   );
 
   const renderScan = () => (
-    <div className="flex flex-col items-center justify-center h-[60vh] text-center px-4">
-      {isProcessing ? (
-        <>
-          <Loader2 className="w-16 h-16 text-green-600 animate-spin mb-6" />
-          <h2 className="text-2xl font-bold text-gray-800 mb-2">{statusMessage}</h2>
-          <p className="text-gray-500 animate-pulse">This usually takes 5-10 seconds.</p>
-        </>
-      ) : (
-         <p>Preparing...</p>
-      )}
+    <div className="flex flex-col items-center justify-center h-[60vh] text-center px-4 space-y-4">
+      <Loader2 className="w-16 h-16 text-green-600 animate-spin" />
+      <div>
+        <h2 className="text-2xl font-bold text-gray-800 mb-2">
+          {loadingStep === 'uploading' ? 'Auto-Exporting...' : (scanMode === 'append' ? 'Processing Page...' : 'Analyzing Invoice...')}
+        </h2>
+        <p className="text-gray-500 animate-pulse">
+          {loadingStep === 'uploading' 
+            ? 'Sending data directly to your Google Sheet...' 
+            : 'Extracting vendors, items, and quantities...'}
+        </p>
+      </div>
     </div>
   );
 
-  const renderSettings = () => (
-    <div className="space-y-6 pb-20">
-       <div className="flex items-center gap-2 mb-6">
-          <Button variant="ghost" onClick={() => setView(AppView.DASHBOARD)} className="pl-0">
-            <ArrowLeft className="w-5 h-5" /> Back
-          </Button>
-          <h2 className="text-2xl font-bold">Settings</h2>
-       </div>
+  const renderSettings = () => {
+    const isScriptUrlWarning = settings.scriptUrl && !settings.scriptUrl.endsWith('/exec');
 
-       <Card className="p-5 space-y-4">
-          <h3 className="font-bold text-lg border-b pb-2">Target Sheet</h3>
-          <Input 
-            label="Google Sheet URL" 
-            value={settings.googleSheetUrl}
-            onChange={(e) => setSettings({...settings, googleSheetUrl: e.target.value})}
-          />
-       </Card>
+    return (
+      <div className="space-y-6 pb-20">
+         <div className="flex items-center gap-2 mb-6">
+            <Button variant="ghost" onClick={() => setView(AppView.DASHBOARD)} className="pl-0">
+              <ArrowLeft className="w-5 h-5" /> Back
+            </Button>
+            <h2 className="text-2xl font-bold">Automation Setup</h2>
+         </div>
 
-       <Card className="p-5 space-y-4 border-blue-100 bg-blue-50">
-          <div className="flex justify-between items-center border-b border-blue-200 pb-2">
-            <h3 className="font-bold text-lg text-blue-900">One-Click Automation</h3>
-            <Badge type={settings.scriptUrl ? 'success' : 'warning'}>{settings.scriptUrl ? 'Active' : 'Inactive'}</Badge>
-          </div>
-          
-          <div className="text-xs bg-white p-3 rounded border border-blue-200 space-y-2">
-            <p>To enable 1-click upload (no copy/paste), you must add this script to your Google Sheet:</p>
-            <ol className="list-decimal pl-4 space-y-1">
-              <li>In your Sheet, go to <strong>Extensions {'>'} Apps Script</strong>.</li>
-              <li>Paste the code below (replace everything).</li>
-              <li>Click <strong>Deploy {'>'} New Deployment</strong>.</li>
-              <li><strong>Crucial:</strong> Set "Who has access" to <strong>"Anyone"</strong>.</li>
-              <li>Copy the "Web App URL" and paste it below.</li>
-            </ol>
-            <pre className="bg-gray-100 p-2 rounded overflow-x-auto text-[10px]">{`function doPost(e) {
-  var data = JSON.parse(e.postData.contents);
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  data.items.forEach(function(item) {
-    // Columns: Vendor, Description, In Stock, PAR, Order, Price
-    sheet.appendRow([item.vendor, item.description, item.inStock, item.par, item.order, item.price]);
-  });
-  return ContentService.createTextOutput("Success").setMimeType(ContentService.MimeType.TEXT);
-}`}</pre>
-          </div>
+         <Card className="p-5 space-y-4 border-blue-100 bg-blue-50">
+            <div className="flex justify-between items-center border-b border-blue-200 pb-2">
+              <h3 className="font-bold text-lg text-blue-900">1. Link Google Sheet</h3>
+              <Badge type={settings.scriptUrl ? 'success' : 'warning'}>{settings.scriptUrl ? 'Connected' : 'Not Linked'}</Badge>
+            </div>
+            
+            <div className="space-y-4">
+               <div className="text-sm text-gray-600 space-y-2">
+                  <p>Follow these steps to create a <strong>New Deployment</strong> (Fixes "No active deployment"):</p>
+                  <ol className="list-decimal pl-4 space-y-2 font-medium text-gray-800">
+                    <li>Go to <a href="https://script.google.com/home" target="_blank" className="text-blue-600 underline">script.google.com</a>.</li>
+                    <li>Create or Open your project.</li>
+                    <li className="relative group">
+                      <div className="bg-white border rounded-md p-2 text-xs font-mono text-gray-600 overflow-x-auto max-h-40">
+                        <pre>{SCRIPT_CODE}</pre>
+                        <Button 
+                          variant="secondary" 
+                          className="absolute top-2 right-2 h-8 text-xs"
+                          onClick={() => {
+                            navigator.clipboard.writeText(SCRIPT_CODE);
+                            setToastMessage("Code copied!");
+                          }}
+                        >
+                          <Copy className="w-3 h-3 mr-1" /> Copy Code
+                        </Button>
+                      </div>
+                      <p className="text-xs text-gray-500 mt-1">Paste this code into the editor (replace everything).</p>
+                    </li>
+                    <li>Click <strong>Deploy</strong> (Blue button, top right) &rarr; <strong>New Deployment</strong>.</li>
+                    <li>Click the Gear Icon ⚙️ (next to "Select type") &rarr; choose <strong>Web App</strong>.</li>
+                    <li className="text-red-600 font-bold bg-red-50 p-1 rounded">
+                      Who has access: Select "Anyone" (Required!)
+                    </li>
+                    <li>Click <strong>Deploy</strong> and copy the <strong>Web App URL</strong>.</li>
+                  </ol>
+               </div>
 
-          <Input 
-            label="Script Web App URL" 
-            placeholder="https://script.google.com/macros/s/..."
-            value={settings.scriptUrl}
-            onChange={(e) => setSettings({...settings, scriptUrl: e.target.value})}
-          />
-       </Card>
-    </div>
-  );
+               <Input 
+                  label="Paste Web App URL Here (/exec)" 
+                  placeholder="https://script.google.com/macros/s/.../exec"
+                  value={settings.scriptUrl}
+                  onChange={(e) => setSettings({...settings, scriptUrl: e.target.value})}
+                />
+                
+                {isScriptUrlWarning && (
+                  <div className="flex items-center gap-2 text-amber-600 text-xs font-bold bg-amber-50 p-2 rounded">
+                    <AlertTriangle className="w-4 h-4" />
+                    Warning: URL should end in '/exec'. Do not use '/edit' or '/dev'.
+                  </div>
+                )}
+                
+                <div className="flex gap-2">
+                  <Button 
+                    onClick={async () => {
+                      if (!settings.scriptUrl) {
+                        setToastMessage("Paste a URL first!");
+                        return;
+                      }
+                      setToastMessage("Testing connection...");
+                      const success = await uploadToScript([{
+                        id: 'test', description: 'Connection Test', vendor: 'Test', inStock: 1, par: 1, order: 0, price: 0
+                      }], settings.scriptUrl);
+                      if (success) {
+                        setToastMessage("Connection Successful! ✅");
+                      } else {
+                        setToastMessage("Connection Failed. Check 'Who has access' is set to 'Anyone'");
+                      }
+                    }}
+                    className="w-full"
+                    variant="secondary"
+                  >
+                    Test Connection
+                  </Button>
+                </div>
+
+               <div className="flex items-center justify-between pt-4 border-t border-blue-200">
+                  <div>
+                     <span className="font-semibold text-gray-800 flex items-center gap-2">
+                       <Zap className="w-4 h-4 text-orange-500" fill="currentColor" /> Auto-Export
+                     </span>
+                     <p className="text-xs text-gray-500">Upload immediately after scan</p>
+                  </div>
+                  <Switch 
+                    checked={settings.autoExport} 
+                    onChange={(val) => setSettings({...settings, autoExport: val})} 
+                  />
+               </div>
+            </div>
+         </Card>
+
+         <Card className="p-5 space-y-4">
+            <h3 className="font-bold text-lg border-b pb-2">Fallback Settings</h3>
+            <p className="text-xs text-gray-500">If automation fails, we will open this sheet for manual pasting.</p>
+            <Input 
+              label="Target Google Sheet URL" 
+              value={settings.googleSheetUrl}
+              onChange={(e) => setSettings({...settings, googleSheetUrl: e.target.value})}
+            />
+         </Card>
+      </div>
+    );
+  }
 
   const renderReview = () => {
     const totalOrder = items.reduce((sum, item) => sum + item.order, 0);
@@ -514,29 +742,38 @@ const App: React.FC = () => {
               </div>
            </div>
            
-           <Button onClick={handleExport} className="w-full bg-green-600 hover:bg-green-700 text-white shadow-lg shadow-green-200 py-3 text-lg">
-              Export to Google Sheet <Sheet className="w-5 h-5 ml-2" />
+           <Button onClick={handleManualExport} className="w-full bg-green-600 hover:bg-green-700 text-white shadow-lg shadow-green-200 py-3 text-lg">
+              Export / Upload <Sheet className="w-5 h-5 ml-2" />
            </Button>
         </div>
 
-        {/* Export Modal */}
+        {/* Manual Export Modal */}
         <Modal 
           isOpen={showExportModal} 
           onClose={() => setShowExportModal(false)}
-          title="Manual Export Required"
+          title="Export Data"
         >
           <div className="space-y-4">
-             <div className="bg-orange-50 text-orange-800 p-3 rounded-lg text-sm flex items-start gap-2">
-               <Copy className="w-5 h-5 flex-shrink-0 mt-0.5" />
-               <p>We couldn't automatically write to your Sheet (browser security). Don't worry, your data is already copied!</p>
+             <div className="bg-blue-50 text-blue-800 p-3 rounded-lg text-sm flex items-start gap-2">
+               <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+               <p>
+                 {settings.scriptUrl 
+                   ? "Auto-export encountered an issue. Please paste manually." 
+                   : "Since automation isn't set up, the data has been copied to your clipboard."}
+               </p>
              </div>
              
              <div className="space-y-2 text-sm text-gray-600">
-               <p className="font-bold text-gray-900">Follow these steps:</p>
+               <p className="font-bold text-gray-900">Manual Steps (Troubleshooting):</p>
+               <ul className="list-disc pl-5 space-y-1">
+                 <li>Did you set "Who has access" to "Anyone"?</li>
+                 <li>Did you select "New Deployment" when updating code?</li>
+               </ul>
+               <p className="font-bold text-gray-900 mt-2">To Paste Manually:</p>
                <ol className="list-decimal pl-5 space-y-2">
-                 <li>Click the button below to open your Sheet.</li>
-                 <li>Click on the first empty cell (under Vendor/Column A).</li>
-                 <li>Paste your data <span className="font-mono bg-gray-100 px-1 rounded">Ctrl+V</span> (or Long Press {'>'} Paste).</li>
+                 <li>Click <strong>Open Sheet</strong> below.</li>
+                 <li>Click the first empty cell under "Vendor".</li>
+                 <li>Paste (<span className="font-mono bg-gray-100 px-1 rounded">Ctrl+V</span>).</li>
                </ol>
              </div>
 
@@ -596,7 +833,6 @@ const App: React.FC = () => {
         <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
         
         {/* Hidden Inputs for File Upload */}
-        {/* Camera Input (forces camera on mobile) */}
         <input 
           type="file" 
           ref={cameraInputRef}
@@ -605,7 +841,6 @@ const App: React.FC = () => {
           capture="environment"
           onChange={handleFileUpload}
         />
-        {/* Generic File Upload Input (allows Gallery/Files/Camera choice) */}
         <input 
           type="file" 
           ref={uploadInputRef}

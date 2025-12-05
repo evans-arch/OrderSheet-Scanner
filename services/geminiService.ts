@@ -9,7 +9,7 @@ const INVOICE_SCHEMA: Schema = {
   properties: {
     vendorName: {
       type: Type.STRING,
-      description: "The printed header text found at the absolute top-left of the page (e.g. 'Asian Vegetables'). Do NOT include handwritten notes found nearby.",
+      description: "The printed header text found at the EXTREME top-left of the page (e.g. 'Asian Vegetables'). Strictly IGNORE handwritten notes.",
     },
     items: {
       type: Type.ARRAY,
@@ -30,11 +30,11 @@ const INVOICE_SCHEMA: Schema = {
           },
           column3_order: {
             type: Type.NUMBER,
-            description: "The handwritten number in the THIRD column (Order), located immediately to the left of the Description. Watch for digits 0, 1, 7.",
+            description: "The handwritten number in the THIRD column (Order), located immediately to the left of the Description. DO NOT confuse with First Column.",
           },
           column4_price: {
             type: Type.NUMBER,
-            description: "The number found to the right of the Description (Price/Weight). If not clear, return 0.",
+            description: "The number found to the right of the Description. STRICTLY IGNORE columns labeled 'lbs', 'Weight', or 'Oz'. Only return a number if it is a monetary Price/Cost. Default to 0.",
           },
         },
         required: ["description"],
@@ -60,9 +60,11 @@ export const extractInvoiceData = async (base64Data: string, mimeType: string): 
           {
             text: `Analyze this inventory sheet/invoice image to extract data for a spreadsheet.
 
-            ### 1. VENDOR NAME (Top Left)
-            - Extract the **PRINTED HEADER** at the top-left (e.g., "Asian Vegetables").
-            - **Strictly ignore** handwritten names or dates near the header.
+            ### 1. VENDOR NAME (EXTREME TOP LEFT)
+            - **HIGHEST PRIORITY:** The Vendor Name is the **FIRST PRINTED TEXT** located at the **EXTREME TOP-LEFT CORNER** of the page.
+            - Examples of Printed Titles: "Asian Vegetables", "General Produce", "Frozen Goods".
+            - **STRICTLY IGNORE** any handwritten text (like names of people, dates, or "VIEN DONG 4") that might be written next to the printed title or circled.
+            - If there is both printed text and handwritten text at the top, **ONLY** extract the printed text.
 
             ### 2. HANDWRITTEN NUMBERS (CRITICAL)
             - This document contains **Handwritten Digits**.
@@ -79,7 +81,7 @@ export const extractInvoiceData = async (base64Data: string, mimeType: string): 
             2. **PAR** (Second Column): Often blank/empty.
             3. **Order** (Third Column): Handwritten numbers. **This column is immediately to the left of the Item Description.**
             4. **Description** (Fourth Column): Printed English text.
-            5. **Price/Lbs** (Right Side): Numbers to the right of description.
+            5. **Price** (Right Side): Look for currency columns. **STRICTLY IGNORE 'lbs', 'Weight', or 'Oz' columns.** If the only number to the right is weight, return 0 for Price.
 
             ### ROW EXTRACTION RULES
             - Extract every row that has a Printed Description.

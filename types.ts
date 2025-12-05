@@ -20,6 +20,7 @@ export interface InvoiceRecord {
 export interface AppSettings {
   googleSheetUrl: string;
   scriptUrl: string; // Webhook URL for Google Apps Script
+  autoExport: boolean;
 }
 
 export enum AppView {
